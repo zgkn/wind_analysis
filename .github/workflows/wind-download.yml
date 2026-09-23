@@ -1,0 +1,65 @@
+name: SE Asia Wind Data Download (925/850/700 hPa)
+
+# Manual trigger only -- press "Run workflow" in the Actions tab (works from
+# the GitHub mobile app too). Downloads and validates ERA5 daily-mean wind
+# data and publishes it as a build artifact. Run wind-plot.yml separately to
+# turn it into a figure -- that way tweaking the plot never re-hits CDS.
+on:
+  workflow_dispatch:
+    inputs:
+      years:
+        description: "Comma-separated years to include"
+        required: false
+        default: "2015,2019,2023,2026"
+      window_end:
+        description: "End of shared calendar window as MM-DD (blank = today minus lag_days, same window applied to every year)"
+        required: false
+        default: ""
+      lag_days:
+        description: "Days behind today to use as window_end when window_end is blank (ERA5T publication lag buffer)"
+        required: false
+        default: "6"
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install -r scripts/requirements-download.txt
+
+      - name: Configure CDS API credentials
+        env:
+          # Falls back to the default CDS API endpoint when the
+          # CDS_API_URL secret isn't set -- only override it if your
+          # CDS account uses a non-default endpoint.
+          CDS_API_URL: ${{ secrets.CDS_API_URL || 'https://cds.climate.copernicus.eu/api' }}
+          CDS_API_KEY: ${{ secrets.CDS_API_KEY }}
+        run: |
+          cat > ~/.cdsapirc <<EOF
+          url: ${CDS_API_URL}
+          key: ${CDS_API_KEY}
+          EOF
+
+      - name: Download + validate ERA5 daily wind data
+        working-directory: scripts
+        run: |
+          ARGS="--years ${{ github.event.inputs.years }} --lag-days ${{ github.event.inputs.lag_days }} --data-dir ../data"
+          if [ -n "${{ github.event.inputs.window_end }}" ]; then
+            ARGS="$ARGS --window-end ${{ github.event.inputs.window_end }}"
+          fi
+          python download_winds.py $ARGS
+
+      - name: Upload downloaded data as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: era5-daily-data
+          path: data/
+          retention-days: 90
