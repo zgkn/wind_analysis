@@ -23,6 +23,7 @@ Usage:
 
 import argparse
 import json
+import zipfile
 from pathlib import Path
 
 from wind_common import (
@@ -41,6 +42,30 @@ from wind_common import (
     time_dim_name,
     window_label,
 )
+
+
+def _unwrap_if_zip(path: Path) -> None:
+    """derived-era5-pressure-levels-daily-statistics sometimes delivers a
+    zip archive even though format=netcdf was requested (the older
+    reanalysis-*-monthly-means dataset never did this). If path is
+    actually a zip, extract its single .nc member in place so downstream
+    code always sees real NetCDF regardless of the .nc filename."""
+    if not zipfile.is_zipfile(path):
+        return
+
+    with zipfile.ZipFile(path) as zf:
+        nc_members = [n for n in zf.namelist() if n.endswith(".nc")]
+        if len(nc_members) != 1:
+            raise RuntimeError(
+                f"{path} is a zip archive but doesn't contain exactly one "
+                f".nc file (found {zf.namelist()}) -- update _unwrap_if_zip "
+                "to handle this archive layout."
+            )
+        extracted = zf.read(nc_members[0])
+
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_bytes(extracted)
+    tmp_path.replace(path)
 
 
 def download_year(client, year: int, months_days: dict[int, list[int]], data_dir: Path) -> list[Path]:
@@ -81,6 +106,7 @@ def download_year(client, year: int, months_days: dict[int, list[int]], data_dir
             request,
             str(target),
         )
+        _unwrap_if_zip(target)
         print(f"[{year}-{month:02d}] saved -> {target}")
         paths.append(target)
 
