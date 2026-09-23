@@ -48,11 +48,16 @@ jobs:
           key: ${CDS_API_KEY}
           EOF
 
+      - name: Compute cache key
+        id: cachekey
+        run: |
+          echo "key=era5-winds-$(echo '${{ github.event.inputs.years }}' | tr ',' '_')" >> "$GITHUB_OUTPUT"
+
       - name: Cache CDS downloads
         uses: actions/cache@v4
         with:
           path: data
-          key: era5-winds-${{ github.event.inputs.years }}
+          key: ${{ steps.cachekey.outputs.key }}
 
       - name: Run download + plot script
         run: |
