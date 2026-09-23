@@ -1,0 +1,6 @@
+cdsapi>=0.7
+xarray>=2024.1
+netCDF4>=1.6
+matplotlib>=3.8
+numpy>=1.26
+cartopy>=0.22
