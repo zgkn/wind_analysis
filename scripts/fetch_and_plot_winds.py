@@ -1,12 +1,24 @@
 #!/usr/bin/env python3
 """
-Fetch ERA5 monthly-mean pressure-level winds (925/850/700 hPa) over
+Fetch ERA5 daily-mean pressure-level winds (925/850/700 hPa) over
 Southeast Asia (Singapore, Peninsular Malaysia, Sumatra, Kalimantan)
 for a set of years, and plot a year x level grid of mean wind maps.
 
 Data source: Copernicus Climate Data Store (CDS)
-Dataset:     reanalysis-era5-pressure-levels-monthly-means
-Product:     monthly_averaged_reanalysis
+Dataset:     derived-era5-pressure-levels-daily-statistics
+Statistic:   daily_mean
+
+Every year is averaged over the *same* calendar window (month/day to
+month/day), not whole calendar months. This matters because whole-month
+averaging silently mismatches years once the current year is still
+in-progress (e.g. comparing an Aug-Oct mean against an Aug-Sep mean is
+not an apples-to-apples comparison of the same seasonal signal). Using
+daily data lets every year -- including one that isn't finished yet --
+share the exact same day range.
+
+The window's end date defaults to "today minus a lag", since ERA5T
+(preliminary near-real-time ERA5) daily data is typically only
+available a few days after the fact; see --lag-days.
 
 Requires a CDS API key configured either via:
   - a ~/.cdsapirc file, or
@@ -17,10 +29,11 @@ secrets before calling this script).
 Usage:
     python fetch_and_plot_winds.py
     python fetch_and_plot_winds.py --years 2015,2019,2023,2026 --skip-download
+    python fetch_and_plot_winds.py --window-start 08-01 --window-end 09-17
 """
 
 import argparse
-import os
+from datetime import date, timedelta
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -31,60 +44,99 @@ import xarray as xr
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Years to compare, and which months (Aug-Oct) are actually available for
-# each. 2026 is a partial year at the time this was written -- only include
-# months that have already occurred. Update this as more months land.
-DEFAULT_YEAR_MONTHS = {
-    2015: [8, 9, 10],
-    2019: [8, 9, 10],
-    2023: [8, 9, 10],
-    2026: [8, 9],  # partial season -- update once Oct 2026 data exists
-}
+DEFAULT_YEARS = [2015, 2019, 2023, 2026]
 
 LEVELS = [925, 850, 700]  # hPa
 
 # CDS area is [North, West, South, East]
 AREA = [10, 95, -10, 120]  # covers Singapore, Peninsular Malaysia, Sumatra, Kalimantan
 
+# Shared comparison window, applied identically to every year (month, day).
+WINDOW_START = (8, 1)
+
+# ERA5T daily data lags behind real time; this is a conservative buffer so
+# --window-end defaults to a date CDS is actually likely to have. Override
+# with --lag-days or an explicit --window-end if CDS has caught up further.
+ERA5T_LAG_DAYS = 6
+
 DATA_DIR = Path("data")
 OUTPUT_DIR = Path("outputs")
+
+
+# ---------------------------------------------------------------------------
+# Calendar window helpers
+# ---------------------------------------------------------------------------
+
+def default_window_end(today: date | None = None, lag_days: int = ERA5T_LAG_DAYS) -> tuple[int, int]:
+    """Latest (month, day) CDS is likely to have daily data for, applied to
+    every comparison year regardless of that year's own calendar position."""
+    today = today or date.today()
+    cutoff = today - timedelta(days=lag_days)
+    return (cutoff.month, cutoff.day)
+
+
+def days_in_window(year: int, start: tuple[int, int], end: tuple[int, int]) -> dict[int, list[int]]:
+    """Return {month: [days]} for every calendar day from start to end
+    (inclusive) in the given year. start/end must not cross a year boundary."""
+    start_date = date(year, *start)
+    end_date = date(year, *end)
+    if end_date < start_date:
+        raise ValueError(f"[{year}] window end {end} is before window start {start}")
+
+    months_days: dict[int, list[int]] = {}
+    d = start_date
+    while d <= end_date:
+        months_days.setdefault(d.month, []).append(d.day)
+        d += timedelta(days=1)
+    return months_days
 
 
 # ---------------------------------------------------------------------------
 # Download
 # ---------------------------------------------------------------------------
 
-def download_year(client, year: int, months: list[int], data_dir: Path) -> Path:
-    """Download monthly-mean u/v wind at the target levels for one year.
+def download_year(client, year: int, months_days: dict[int, list[int]], data_dir: Path) -> list[Path]:
+    """Download one year's daily-mean u/v wind at the target levels, one CDS
+    request per calendar month in the window (since each month may need a
+    different subset of days -- a full month, or a partial one).
 
-    Returns the path to the downloaded NetCDF file. Skips download if the
-    file already exists (handy for re-runs / manual triggers).
+    Returns the list of NetCDF file paths for that year. Skips a request if
+    its file already exists (handy for re-runs / manual triggers).
     """
     data_dir.mkdir(parents=True, exist_ok=True)
-    target = data_dir / f"era5_winds_{year}.nc"
-    if target.exists():
-        print(f"[{year}] already downloaded -> {target}")
-        return target
+    paths = []
 
-    request = {
-        "product_type": "monthly_averaged_reanalysis",
-        "variable": ["u_component_of_wind", "v_component_of_wind"],
-        "pressure_level": [str(lv) for lv in LEVELS],
-        "year": str(year),
-        "month": [f"{m:02d}" for m in months],
-        "time": "00:00",
-        "area": AREA,
-        "format": "netcdf",
-    }
+    for month, days in sorted(months_days.items()):
+        target = data_dir / f"era5_daily_winds_{year}_{month:02d}.nc"
+        if target.exists():
+            print(f"[{year}-{month:02d}] already downloaded -> {target}")
+            paths.append(target)
+            continue
 
-    print(f"[{year}] requesting months {months} at levels {LEVELS} hPa ...")
-    client.retrieve(
-        "reanalysis-era5-pressure-levels-monthly-means",
-        request,
-        str(target),
-    )
-    print(f"[{year}] saved -> {target}")
-    return target
+        request = {
+            "product_type": "reanalysis",
+            "variable": ["u_component_of_wind", "v_component_of_wind"],
+            "pressure_level": [str(lv) for lv in LEVELS],
+            "year": str(year),
+            "month": f"{month:02d}",
+            "day": [f"{d:02d}" for d in days],
+            "daily_statistic": "daily_mean",
+            "time_zone": "utc+00:00",
+            "frequency": "1_hourly",
+            "area": AREA,
+            "format": "netcdf",
+        }
+
+        print(f"[{year}-{month:02d}] requesting {len(days)} day(s) at levels {LEVELS} hPa ...")
+        client.retrieve(
+            "derived-era5-pressure-levels-daily-statistics",
+            request,
+            str(target),
+        )
+        print(f"[{year}-{month:02d}] saved -> {target}")
+        paths.append(target)
+
+    return paths
 
 
 # ---------------------------------------------------------------------------
@@ -118,11 +170,29 @@ def _standardize_names(ds: xr.Dataset) -> xr.Dataset:
     return ds
 
 
-def load_year_mean(path: Path) -> xr.Dataset:
-    """Load one year's file and return the Aug-Oct time-mean u/v at each level."""
-    ds = xr.open_dataset(path)
+def load_year_mean(year: int, paths: list[Path], expected_num_days: int) -> xr.Dataset:
+    """Load one year's daily files, verify the day count matches what was
+    requested, and return the time-mean u/v at each level.
+
+    Raises loudly rather than silently averaging over fewer days than
+    requested -- CDS can return a short file without erroring (e.g. when a
+    requested day's daily-mean doesn't exist yet), and that must not pass
+    as a same-length comparison against other years.
+    """
+    ds = xr.open_mfdataset([str(p) for p in paths], combine="by_coords")
     ds = _standardize_names(ds)
     time_dim = "time" if "time" in ds.dims else [d for d in ds.dims if "time" in d][0]
+
+    actual_num_days = ds.sizes[time_dim]
+    if actual_num_days != expected_num_days:
+        raise RuntimeError(
+            f"[{year}] expected {expected_num_days} daily values but got "
+            f"{actual_num_days} -- CDS likely doesn't have all requested days "
+            "yet (check ERA5T publication lag / --lag-days), or a partial "
+            "download is cached under data/. Delete the stale file(s) and "
+            "re-run rather than silently comparing a shorter mean."
+        )
+
     return ds.mean(dim=time_dim, keep_attrs=True)
 
 
@@ -130,7 +200,7 @@ def load_year_mean(path: Path) -> xr.Dataset:
 # Plotting
 # ---------------------------------------------------------------------------
 
-def plot_grid(year_means: dict[int, xr.Dataset], levels: list[int], out_path: Path):
+def plot_grid(year_means: dict[int, xr.Dataset], levels: list[int], window_label: str, out_path: Path):
     """Plot a (years x levels) grid of mean wind maps: speed shading + vectors."""
     try:
         import cartopy.crs as ccrs
@@ -207,8 +277,8 @@ def plot_grid(year_means: dict[int, xr.Dataset], levels: list[int], out_path: Pa
                 )
 
     fig.suptitle(
-        "Mean Aug\u2013Oct wind, 925/850/700 hPa \u2014 Singapore / Peninsular Malaysia / Sumatra / Kalimantan\n"
-        "(ERA5 reanalysis; 2026 partial season, ERA5T preliminary)",
+        f"Mean {window_label} wind, 925/850/700 hPa — Singapore / Peninsular Malaysia / Sumatra / Kalimantan\n"
+        "(ERA5 daily-mean reanalysis; same calendar window per year; ERA5T preliminary for the current year)",
         fontsize=13,
     )
     fig.subplots_adjust(right=0.9, top=0.90, left=0.08)
@@ -224,22 +294,30 @@ def plot_grid(year_means: dict[int, xr.Dataset], levels: list[int], out_path: Pa
 # Main
 # ---------------------------------------------------------------------------
 
-def parse_year_months(arg: str) -> dict[int, list[int]]:
-    """Parse '--years 2015,2019,2023,2026' using DEFAULT_YEAR_MONTHS for months."""
-    years = [int(y.strip()) for y in arg.split(",")]
-    result = {}
-    for y in years:
-        if y not in DEFAULT_YEAR_MONTHS:
-            raise ValueError(f"No default month list for {y}; edit DEFAULT_YEAR_MONTHS.")
-        result[y] = DEFAULT_YEAR_MONTHS[y]
-    return result
+def parse_month_day(arg: str) -> tuple[int, int]:
+    """Parse 'MM-DD' into (month, day)."""
+    month_str, day_str = arg.split("-")
+    return (int(month_str), int(day_str))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--years", default="2015,2019,2023,2026",
-        help="Comma-separated years to include (default: 2015,2019,2023,2026)",
+        "--years", default=",".join(str(y) for y in DEFAULT_YEARS),
+        help=f"Comma-separated years to include (default: {','.join(str(y) for y in DEFAULT_YEARS)})",
+    )
+    parser.add_argument(
+        "--window-start", default=f"{WINDOW_START[0]:02d}-{WINDOW_START[1]:02d}",
+        help="Start of the shared calendar window, as MM-DD (default: 08-01)",
+    )
+    parser.add_argument(
+        "--window-end", default=None,
+        help="End of the shared calendar window, as MM-DD (default: today minus --lag-days)",
+    )
+    parser.add_argument(
+        "--lag-days", type=int, default=ERA5T_LAG_DAYS,
+        help=f"Days to subtract from today when --window-end isn't given, to stay behind "
+             f"the ERA5T publication lag (default: {ERA5T_LAG_DAYS})",
     )
     parser.add_argument(
         "--skip-download", action="store_true",
@@ -255,28 +333,45 @@ def main():
     )
     args = parser.parse_args()
 
-    year_months = parse_year_months(args.years)
+    years = [int(y.strip()) for y in args.years.split(",")]
+    window_start = parse_month_day(args.window_start)
+    window_end = parse_month_day(args.window_end) if args.window_end else default_window_end(lag_days=args.lag_days)
     data_dir = Path(args.data_dir)
 
+    year_months_days = {year: days_in_window(year, window_start, window_end) for year in years}
+    expected_num_days = sum(len(days) for days in year_months_days[years[0]].values())
+
+    window_label = (
+        f"{date(2000, *window_start).strftime('%b %d')}"
+        f"–{date(2000, *window_end).strftime('%b %d')}"
+    )
+    print(f"Comparison window: {window_label} ({expected_num_days} days), years: {years}")
+
+    year_paths: dict[int, list[Path]] = {}
     if not args.skip_download:
         import cdsapi
         client = cdsapi.Client()
-        for year, months in year_months.items():
-            download_year(client, year, months, data_dir)
+        for year, months_days in year_months_days.items():
+            year_paths[year] = download_year(client, year, months_days, data_dir)
     else:
         print("skip-download set: reusing files already in", data_dir)
+        for year, months_days in year_months_days.items():
+            year_paths[year] = [
+                data_dir / f"era5_daily_winds_{year}_{month:02d}.nc"
+                for month in sorted(months_days)
+            ]
 
     year_means = {}
-    for year in year_months:
-        path = data_dir / f"era5_winds_{year}.nc"
-        if not path.exists():
+    for year, paths in year_paths.items():
+        missing = [p for p in paths if not p.exists()]
+        if missing:
             raise FileNotFoundError(
-                f"Missing {path} -- run without --skip-download first, "
+                f"[{year}] missing {missing} -- run without --skip-download first, "
                 "or check the CDS request succeeded."
             )
-        year_means[year] = load_year_mean(path)
+        year_means[year] = load_year_mean(year, paths, expected_num_days)
 
-    plot_grid(year_means, LEVELS, Path(args.out))
+    plot_grid(year_means, LEVELS, window_label, Path(args.out))
 
 
 if __name__ == "__main__":

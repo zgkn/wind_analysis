@@ -9,6 +9,14 @@ on:
         description: "Comma-separated years to include"
         required: false
         default: "2015,2019,2023,2026"
+      window_end:
+        description: "End of shared calendar window as MM-DD (blank = today minus lag_days, same window applied to every year)"
+        required: false
+        default: ""
+      lag_days:
+        description: "Days behind today to use as window_end when window_end is blank (ERA5T publication lag buffer)"
+        required: false
+        default: "6"
       skip_download:
         description: "Reuse cached data/ files instead of re-downloading from CDS"
         required: false
@@ -51,7 +59,12 @@ jobs:
       - name: Compute cache key
         id: cachekey
         run: |
-          echo "key=era5-winds-$(echo '${{ github.event.inputs.years }}' | tr ',' '_')" >> "$GITHUB_OUTPUT"
+          # Keyed on today's UTC date too: the shared window's end date
+          # (today minus lag_days, when window_end isn't set explicitly)
+          # moves forward daily, so yesterday's cached partial-month files
+          # must not be reused as if they covered today's day count.
+          YEARS_SAFE=$(echo '${{ github.event.inputs.years }}' | tr ',' '_')
+          echo "key=era5-daily-$(date -u +%Y%m%d)-${YEARS_SAFE}-${{ github.event.inputs.window_end }}" >> "$GITHUB_OUTPUT"
 
       - name: Cache CDS downloads
         uses: actions/cache@v4
@@ -61,7 +74,10 @@ jobs:
 
       - name: Run download + plot script
         run: |
-          ARGS="--years ${{ github.event.inputs.years }}"
+          ARGS="--years ${{ github.event.inputs.years }} --lag-days ${{ github.event.inputs.lag_days }}"
+          if [ -n "${{ github.event.inputs.window_end }}" ]; then
+            ARGS="$ARGS --window-end ${{ github.event.inputs.window_end }}"
+          fi
           if [ "${{ github.event.inputs.skip_download }}" = "true" ]; then
             ARGS="$ARGS --skip-download"
           fi
