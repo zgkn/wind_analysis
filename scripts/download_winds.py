@@ -12,6 +12,13 @@ a manifest.json describing exactly what was fetched, but does no plotting.
 Run plot_winds.py separately against its output to (re)generate the figure
 without re-hitting CDS -- handy when only the plot styling needs changing.
 
+Since every comparison year shares the identical (month, day) window by
+construction, each month is requested for all years in a single combined
+CDS request (year passed as a list) rather than one request per year --
+this cuts the number of times we sit in CDS's queue roughly N-fold for N
+years. If CDS rejects a multi-year request for this dataset, this falls
+back to one request per year automatically.
+
 Requires a CDS API key configured either via:
   - a ~/.cdsapirc file, or
   - the CDSAPI_URL and CDSAPI_KEY environment variables
@@ -23,6 +30,8 @@ Usage:
 
 import argparse
 import json
+import threading
+import time
 import zipfile
 from pathlib import Path
 
@@ -43,8 +52,35 @@ from wind_common import (
     window_label,
 )
 
+HEARTBEAT_INTERVAL_SECONDS = 120
 
-def _download_and_extract(client, dataset: str, request: dict, stub: Path) -> list[Path]:
+
+def _run_with_heartbeat(label: str, fn, *args, interval: int = HEARTBEAT_INTERVAL_SECONDS, **kwargs):
+    """Run a blocking call while printing a heartbeat periodically. CDS's
+    own client only logs when a request's status *changes* (e.g. accepted
+    -> running); a request can sit unchanged in CDS's queue for hours with
+    zero output, which looks indistinguishable from a hang in CI logs. This
+    prints something on a fixed cadence regardless, so a long wait still
+    shows visible progress.
+    """
+    done = threading.Event()
+    start = time.monotonic()
+
+    def _heartbeat():
+        while not done.wait(interval):
+            elapsed = int(time.monotonic() - start)
+            print(f"[{label}] still waiting on CDS ({elapsed // 60}m{elapsed % 60:02d}s elapsed) ...", flush=True)
+
+    t = threading.Thread(target=_heartbeat, daemon=True)
+    t.start()
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        done.set()
+        t.join()
+
+
+def _download_and_extract(client, dataset: str, request: dict, stub: Path, label: str) -> list[Path]:
     """Retrieve one CDS request and return the real NetCDF file(s) it
     contains. derived-era5-pressure-levels-daily-statistics sometimes
     delivers a zip archive even though format=netcdf was requested (the
@@ -53,7 +89,7 @@ def _download_and_extract(client, dataset: str, request: dict, stub: Path) -> li
     combined file. Handle both shapes rather than assuming either one.
     """
     raw = stub.with_suffix(".download")
-    client.retrieve(dataset, request, str(raw))
+    _run_with_heartbeat(label, client.retrieve, dataset, request, str(raw))
 
     if not zipfile.is_zipfile(raw):
         final = stub.with_suffix(".nc")
@@ -74,50 +110,101 @@ def _download_and_extract(client, dataset: str, request: dict, stub: Path) -> li
     return extracted
 
 
-def download_year(client, year: int, months_days: dict[int, list[int]], data_dir: Path) -> list[Path]:
-    """Download one year's daily-mean u/v wind at the target levels, one CDS
-    request per calendar month in the window (a month may need a full set of
-    days or a partial one, depending on where it falls in the window). CDS
-    may return each month's request as one file or several (see
-    _download_and_extract) -- callers shouldn't assume a fixed count.
+def _base_request(month: int, days: list[int]) -> dict:
+    return {
+        "product_type": "reanalysis",
+        "variable": ["u_component_of_wind", "v_component_of_wind"],
+        "pressure_level": [str(lv) for lv in LEVELS],
+        "month": f"{month:02d}",
+        "day": [f"{d:02d}" for d in days],
+        "daily_statistic": "daily_mean",
+        "time_zone": "utc+00:00",
+        "frequency": "1_hourly",
+        "area": AREA,
+        "format": "netcdf",
+    }
 
-    Returns the list of NetCDF file paths for that year. Skips a month's
-    request if matching file(s) already exist (handy for re-runs / manual
-    triggers).
-    """
-    data_dir.mkdir(parents=True, exist_ok=True)
-    paths = []
 
-    for month, days in sorted(months_days.items()):
+def _month_already_downloaded(data_dir: Path, years: list[int], month: int) -> bool:
+    return all(
+        list(data_dir.glob(f"{daily_file_stub(data_dir, year, month).name}*.nc"))
+        for year in years
+    )
+
+
+def _existing_month_files(data_dir: Path, years: list[int], month: int) -> dict[int, list[Path]]:
+    return {
+        year: sorted(data_dir.glob(f"{daily_file_stub(data_dir, year, month).name}*.nc"))
+        for year in years
+    }
+
+
+def download_month_per_year(client, month: int, days: list[int], years: list[int], data_dir: Path) -> dict[int, list[Path]]:
+    """Fallback path: one CDS request per year for this month."""
+    result = {}
+    for year in years:
         stub = daily_file_stub(data_dir, year, month)
         existing = sorted(data_dir.glob(f"{stub.name}*.nc"))
         if existing:
             print(f"[{year}-{month:02d}] already downloaded -> {existing}")
-            paths.extend(existing)
+            result[year] = existing
             continue
 
-        request = {
-            "product_type": "reanalysis",
-            "variable": ["u_component_of_wind", "v_component_of_wind"],
-            "pressure_level": [str(lv) for lv in LEVELS],
-            "year": str(year),
-            "month": f"{month:02d}",
-            "day": [f"{d:02d}" for d in days],
-            "daily_statistic": "daily_mean",
-            "time_zone": "utc+00:00",
-            "frequency": "1_hourly",
-            "area": AREA,
-            "format": "netcdf",
-        }
-
-        print(f"[{year}-{month:02d}] requesting {len(days)} day(s) at levels {LEVELS} hPa ...")
+        request = _base_request(month, days)
+        request["year"] = str(year)
+        label = f"{year}-{month:02d}"
+        print(f"[{label}] requesting {len(days)} day(s) at levels {LEVELS} hPa ...")
         month_paths = _download_and_extract(
-            client, "derived-era5-pressure-levels-daily-statistics", request, stub
+            client, "derived-era5-pressure-levels-daily-statistics", request, stub, label
         )
-        print(f"[{year}-{month:02d}] saved -> {month_paths}")
-        paths.extend(month_paths)
+        print(f"[{label}] saved -> {month_paths}")
+        result[year] = month_paths
+    return result
 
-    return paths
+
+def download_month(client, month: int, days: list[int], years: list[int], data_dir: Path) -> dict[int, list[Path]]:
+    """Download one month's data across all comparison years, preferring a
+    single combined request (year as a list) over one request per year --
+    each request queues independently in CDS, so fewer, larger requests
+    means far less total time spent waiting in that queue. Falls back to
+    download_month_per_year if CDS rejects a multi-year request.
+    """
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    if _month_already_downloaded(data_dir, years, month):
+        existing = _existing_month_files(data_dir, years, month)
+        print(f"[month {month:02d}] already downloaded for {years}")
+        return existing
+
+    label = f"month {month:02d} x {years}"
+    stub = data_dir / f"era5_daily_winds_multiyear_{month:02d}"
+    request = _base_request(month, days)
+    request["year"] = [str(y) for y in years]
+
+    try:
+        print(f"[{label}] requesting {len(days)} day(s) x {len(years)} year(s) as one combined request ...")
+        member_paths = _download_and_extract(
+            client, "derived-era5-pressure-levels-daily-statistics", request, stub, label
+        )
+    except Exception as exc:
+        print(f"[{label}] combined multi-year request failed ({exc}); falling back to one request per year")
+        stub.with_suffix(".download").unlink(missing_ok=True)
+        return download_month_per_year(client, month, days, years, data_dir)
+
+    combined = open_year_dataset(member_paths)
+    time_dim = time_dim_name(combined)
+    result = {}
+    for year in years:
+        year_ds = combined.where(combined[time_dim].dt.year == year, drop=True)
+        out_path = daily_file_stub(data_dir, year, month).with_suffix(".nc")
+        year_ds.to_netcdf(out_path)
+        result[year] = [out_path]
+    combined.close()
+    for p in member_paths:
+        p.unlink()
+
+    print(f"[{label}] saved -> {[str(p) for paths in result.values() for p in paths]}")
+    return result
 
 
 def validate_year(year: int, paths: list[Path], expected_num_days: int) -> None:
@@ -166,19 +253,28 @@ def main():
     window_end = parse_month_day(args.window_end) if args.window_end else default_window_end(lag_days=args.lag_days)
     data_dir = Path(args.data_dir)
 
-    year_months_days = {year: days_in_window(year, window_start, window_end) for year in years}
-    expected_num_days = sum(len(days) for days in year_months_days[years[0]].values())
+    # Every year shares the identical (month, day) window by construction,
+    # so the day list per month is the same for all years -- take it from
+    # the first year and reuse it for the combined multi-year requests.
+    shared_months_days = days_in_window(years[0], window_start, window_end)
+    expected_num_days = sum(len(days) for days in shared_months_days.values())
     label = window_label(window_start, window_end)
-    print(f"Comparison window: {label} ({expected_num_days} days), years: {years}")
+    print(f"Comparison window: {label} ({expected_num_days} days), years: {years}", flush=True)
 
     import cdsapi
     client = cdsapi.Client()
 
+    year_paths: dict[int, list[Path]] = {year: [] for year in years}
+    for month, days in sorted(shared_months_days.items()):
+        month_result = download_month(client, month, days, years, data_dir)
+        for year, paths in month_result.items():
+            year_paths[year].extend(paths)
+
     year_files: dict[int, list[str]] = {}
-    for year, months_days in year_months_days.items():
-        paths = download_year(client, year, months_days, data_dir)
-        validate_year(year, paths, expected_num_days)
-        year_files[year] = [p.name for p in paths]
+    for year in years:
+        validate_year(year, year_paths[year], expected_num_days)
+        year_files[year] = [p.name for p in year_paths[year]]
+        print(f"[{year}] validated: {expected_num_days} days OK", flush=True)
 
     manifest = {
         "years": years,
