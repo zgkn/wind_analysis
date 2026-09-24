@@ -4,20 +4,30 @@ Download ERA5 daily-mean pressure-level winds (925/850/700 hPa) over
 Southeast Asia for a set of years, all sharing the same calendar window.
 
 Data source: Copernicus Climate Data Store (CDS)
-Dataset:     derived-era5-pressure-levels-daily-statistics
-Statistic:   daily_mean
+Dataset:     reanalysis-era5-pressure-levels (plain archived hourly data)
 
 This is the download-only half of the pipeline: it fetches data and writes
 a manifest.json describing exactly what was fetched, but does no plotting.
 Run plot_winds.py separately against its output to (re)generate the figure
 without re-hitting CDS -- handy when only the plot styling needs changing.
 
+Earlier versions of this script used derived-era5-pressure-levels-daily-
+statistics, a CDS "toolbox" dataset that computes the daily mean on demand
+server-side. That dataset's compute queue was observed taking 90 minutes to
+2+ hours per request under normal load -- not a bug on our end, just how
+backed up that queue was. reanalysis-era5-pressure-levels is a plain
+*archived* dataset (CDS just hands back a pre-existing file, no server-side
+computation), which is why the original monthly-means dataset always
+returned in seconds -- so this fetches the 4 synoptic hours per day
+(00/06/12/18 UTC) directly from the archive and computes the daily vector-
+mean ourselves, the same technique already used for the CFSv2 pipeline
+(download_winds_cfsv2.py). Downstream files still end up as one value per
+day, so plot_winds.py needs no changes.
+
 Since every comparison year shares the identical (month, day) window by
-construction, each month is requested for all years in a single combined
-CDS request (year passed as a list) rather than one request per year --
-this cuts the number of times we sit in CDS's queue roughly N-fold for N
-years. If CDS rejects a multi-year request for this dataset, this falls
-back to one request per year automatically.
+construction, each month is first tried as a single combined request across
+all years (year passed as a list); if CDS rejects that, it falls back to
+one request per year automatically.
 
 Requires a CDS API key configured either via:
   - a ~/.cdsapirc file, or
@@ -52,17 +62,17 @@ from wind_common import (
     window_label,
 )
 
+DATASET = "reanalysis-era5-pressure-levels"
+SYNOPTIC_HOURS = ["00:00", "06:00", "12:00", "18:00"]
+
 HEARTBEAT_INTERVAL_SECONDS = 120
 
 
 def _run_with_heartbeat(label: str, fn, *args, interval: int = HEARTBEAT_INTERVAL_SECONDS, **kwargs):
-    """Run a blocking call while printing a heartbeat periodically. CDS's
-    own client only logs when a request's status *changes* (e.g. accepted
-    -> running); a request can sit unchanged in CDS's queue for hours with
-    zero output, which looks indistinguishable from a hang in CI logs. This
-    prints something on a fixed cadence regardless, so a long wait still
-    shows visible progress.
-    """
+    """Run a blocking call while printing a heartbeat periodically. Kept
+    from the daily-statistics version even though this archive dataset is
+    expected to return quickly -- cheap insurance against another
+    unexpectedly slow CDS queue."""
     done = threading.Event()
     start = time.monotonic()
 
@@ -82,17 +92,14 @@ def _run_with_heartbeat(label: str, fn, *args, interval: int = HEARTBEAT_INTERVA
 
 def _download_and_extract(client, dataset: str, request: dict, stub: Path, label: str) -> list[Path]:
     """Retrieve one CDS request and return the real NetCDF file(s) it
-    contains. derived-era5-pressure-levels-daily-statistics sometimes
-    delivers a zip archive even though format=netcdf was requested (the
-    older reanalysis-*-monthly-means dataset never did this), and when it
-    does, u and v each come back as a separate .nc member rather than one
-    combined file. Handle both shapes rather than assuming either one.
-    """
+    contains. Some CDS datasets deliver a zip archive even with
+    format=netcdf requested, sometimes splitting u/v into separate .nc
+    members -- handle both shapes rather than assuming either one."""
     raw = stub.with_suffix(".download")
     _run_with_heartbeat(label, client.retrieve, dataset, request, str(raw))
 
     if not zipfile.is_zipfile(raw):
-        final = stub.with_suffix(".nc")
+        final = stub.with_suffix(".rawnc")
         raw.replace(final)
         return [final]
 
@@ -103,11 +110,28 @@ def _download_and_extract(client, dataset: str, request: dict, stub: Path, label
             raise RuntimeError(f"{raw} is a zip archive with no .nc members: {zf.namelist()}")
         for member in nc_members:
             suffix = Path(member).stem
-            out_path = stub.parent / f"{stub.name}_{suffix}.nc"
+            out_path = stub.parent / f"{stub.name}_{suffix}.rawnc"
             out_path.write_bytes(zf.read(member))
             extracted.append(out_path)
     raw.unlink()
     return extracted
+
+
+def _finalize_daily_mean(raw_paths: list[Path], out_path: Path) -> None:
+    """Collapse raw hourly archive files (4 synoptic times/day) into a
+    single daily-mean NetCDF at out_path, replacing the raw files.
+    Downstream code (validate_year, plot_winds.py) then sees exactly one
+    time-value per day, same as when CDS's toolbox endpoint computed this
+    for us server-side -- just done client-side now against the fast
+    plain archive dataset instead.
+    """
+    ds = open_year_dataset(raw_paths)
+    time_dim = time_dim_name(ds)
+    daily = ds.resample({time_dim: "1D"}).mean(keep_attrs=True).load()
+    ds.close()
+    daily.to_netcdf(out_path)
+    for p in raw_paths:
+        p.unlink()
 
 
 def _base_request(month: int, days: list[int]) -> dict:
@@ -117,9 +141,7 @@ def _base_request(month: int, days: list[int]) -> dict:
         "pressure_level": [str(lv) for lv in LEVELS],
         "month": f"{month:02d}",
         "day": [f"{d:02d}" for d in days],
-        "daily_statistic": "daily_mean",
-        "time_zone": "utc+00:00",
-        "frequency": "1_hourly",
+        "time": SYNOPTIC_HOURS,
         "area": AREA,
         "format": "netcdf",
     }
@@ -127,47 +149,43 @@ def _base_request(month: int, days: list[int]) -> dict:
 
 def _month_already_downloaded(data_dir: Path, years: list[int], month: int) -> bool:
     return all(
-        list(data_dir.glob(f"{daily_file_stub(data_dir, year, month).name}*.nc"))
+        daily_file_stub(data_dir, year, month).with_suffix(".nc").exists()
         for year in years
     )
 
 
 def _existing_month_files(data_dir: Path, years: list[int], month: int) -> dict[int, list[Path]]:
-    return {
-        year: sorted(data_dir.glob(f"{daily_file_stub(data_dir, year, month).name}*.nc"))
-        for year in years
-    }
+    return {year: [daily_file_stub(data_dir, year, month).with_suffix(".nc")] for year in years}
 
 
 def download_month_per_year(client, month: int, days: list[int], years: list[int], data_dir: Path) -> dict[int, list[Path]]:
     """Fallback path: one CDS request per year for this month."""
     result = {}
     for year in years:
-        stub = daily_file_stub(data_dir, year, month)
-        existing = sorted(data_dir.glob(f"{stub.name}*.nc"))
-        if existing:
-            print(f"[{year}-{month:02d}] already downloaded -> {existing}")
-            result[year] = existing
+        out_path = daily_file_stub(data_dir, year, month).with_suffix(".nc")
+        if out_path.exists():
+            print(f"[{year}-{month:02d}] already downloaded -> {out_path}")
+            result[year] = [out_path]
             continue
 
+        stub = daily_file_stub(data_dir, year, month)
         request = _base_request(month, days)
         request["year"] = str(year)
         label = f"{year}-{month:02d}"
-        print(f"[{label}] requesting {len(days)} day(s) at levels {LEVELS} hPa ...")
-        month_paths = _download_and_extract(
-            client, "derived-era5-pressure-levels-daily-statistics", request, stub, label
-        )
-        print(f"[{label}] saved -> {month_paths}")
-        result[year] = month_paths
+        print(f"[{label}] requesting {len(days)} day(s) x {len(SYNOPTIC_HOURS)} synoptic hour(s) ...")
+        raw_paths = _download_and_extract(client, DATASET, request, stub, label)
+        _finalize_daily_mean(raw_paths, out_path)
+        print(f"[{label}] saved -> {out_path}")
+        result[year] = [out_path]
     return result
 
 
 def download_month(client, month: int, days: list[int], years: list[int], data_dir: Path) -> dict[int, list[Path]]:
     """Download one month's data across all comparison years, preferring a
-    single combined request (year as a list) over one request per year --
-    each request queues independently in CDS, so fewer, larger requests
-    means far less total time spent waiting in that queue. Falls back to
-    download_month_per_year if CDS rejects a multi-year request.
+    single combined request (year as a list) over one request per year.
+    Falls back to download_month_per_year if CDS rejects a multi-year
+    request (observed to happen on the old toolbox dataset over its "cost"
+    limit; unconfirmed whether this archive dataset has the same limit).
     """
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -183,24 +201,23 @@ def download_month(client, month: int, days: list[int], years: list[int], data_d
 
     try:
         print(f"[{label}] requesting {len(days)} day(s) x {len(years)} year(s) as one combined request ...")
-        member_paths = _download_and_extract(
-            client, "derived-era5-pressure-levels-daily-statistics", request, stub, label
-        )
+        raw_paths = _download_and_extract(client, DATASET, request, stub, label)
     except Exception as exc:
         print(f"[{label}] combined multi-year request failed ({exc}); falling back to one request per year")
         stub.with_suffix(".download").unlink(missing_ok=True)
         return download_month_per_year(client, month, days, years, data_dir)
 
-    combined = open_year_dataset(member_paths)
+    combined = open_year_dataset(raw_paths)
     time_dim = time_dim_name(combined)
     result = {}
     for year in years:
         year_ds = combined.where(combined[time_dim].dt.year == year, drop=True)
+        daily = year_ds.resample({time_dim: "1D"}).mean(keep_attrs=True).load()
         out_path = daily_file_stub(data_dir, year, month).with_suffix(".nc")
-        year_ds.to_netcdf(out_path)
+        daily.to_netcdf(out_path)
         result[year] = [out_path]
     combined.close()
-    for p in member_paths:
+    for p in raw_paths:
         p.unlink()
 
     print(f"[{label}] saved -> {[str(p) for paths in result.values() for p in paths]}")
