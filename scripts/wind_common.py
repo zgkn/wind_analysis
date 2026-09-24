@@ -110,11 +110,14 @@ def standardize_names(ds: xr.Dataset) -> xr.Dataset:
 def open_year_dataset(paths: list[Path]) -> xr.Dataset:
     """Open and standardize (but don't average) one year's daily files.
 
-    chunks=None avoids xarray's default dask-backed lazy loading -- these
-    files are small (single-digit MB per region/month), so plain in-memory
-    loading is simpler than adding a dask dependency for no real benefit.
+    Uses plain xr.open_dataset() per file + xr.combine_by_coords() instead
+    of xr.open_mfdataset(), which routes through dask-backed chunking
+    internals even when chunks=None -- these files are small enough
+    (single-digit MB per region/month) that eager, non-dask loading is
+    simpler than adding a dask dependency for no real benefit.
     """
-    ds = xr.open_mfdataset([str(p) for p in paths], combine="by_coords", chunks=None)
+    datasets = [xr.open_dataset(p) for p in paths]
+    ds = xr.combine_by_coords(datasets, combine_attrs="override")
     return standardize_names(ds)
 
 
