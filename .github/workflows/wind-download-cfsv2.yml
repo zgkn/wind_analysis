@@ -1,0 +1,60 @@
+name: SE Asia Wind Data Download - CFSv2 (925/850/700 hPa)
+
+# Manual trigger only. Alternative data source to wind-download.yml (ERA5/CDS,
+# untouched by this workflow) -- fetches NOAA CFSv2 reanalysis instead.
+# No API key needed: this is a public NOAA archive over plain HTTP.
+on:
+  workflow_dispatch:
+    inputs:
+      years:
+        description: "Comma-separated years to include"
+        required: false
+        default: "2015,2019,2023,2026"
+      window_end:
+        description: "End of shared calendar window as MM-DD (blank = today minus lag_days, same window applied to every year)"
+        required: false
+        default: ""
+      lag_days:
+        description: "Days behind today to use as window_end when window_end is blank (CFSv2 publication lag buffer)"
+        required: false
+        default: "2"
+      max_workers:
+        description: "Parallel day-downloads (this archive has no request queue, unlike CDS)"
+        required: false
+        default: "4"
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies for cfgrib (eccodes)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libeccodes0 libeccodes-dev
+
+      - name: Install Python dependencies
+        run: pip install -r scripts/requirements-cfsv2-download.txt
+
+      - name: Download + validate CFSv2 daily wind data
+        working-directory: scripts
+        run: |
+          ARGS="--years ${{ github.event.inputs.years }} --lag-days ${{ github.event.inputs.lag_days }} --max-workers ${{ github.event.inputs.max_workers }} --data-dir ../data_cfsv2"
+          if [ -n "${{ github.event.inputs.window_end }}" ]; then
+            ARGS="$ARGS --window-end ${{ github.event.inputs.window_end }}"
+          fi
+          python download_winds_cfsv2.py $ARGS
+
+      - name: Upload downloaded data as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cfsv2-daily-data
+          path: data_cfsv2/
+          retention-days: 90

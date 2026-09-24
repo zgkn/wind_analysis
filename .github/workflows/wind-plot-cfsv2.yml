@@ -1,0 +1,73 @@
+name: SE Asia Wind Map Plot - CFSv2 (925/850/700 hPa)
+
+# Manual trigger only. Pulls the data artifact from a wind-download-cfsv2.yml
+# run (the most recent successful one by default) and plots it -- never
+# touches NOAA's servers.
+on:
+  workflow_dispatch:
+    inputs:
+      download_run_id:
+        description: "Run ID of the wind-download-cfsv2 run to plot from (blank = most recent successful run)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  plot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Resolve download run ID
+        id: resolve
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ github.event.inputs.download_run_id }}" ]; then
+            RUN_ID="${{ github.event.inputs.download_run_id }}"
+            echo "Using specified download run: $RUN_ID"
+          else
+            RUN_ID=$(gh api "repos/${{ github.repository }}/actions/workflows/wind-download-cfsv2.yml/runs?status=success&per_page=1" --jq '.workflow_runs[0].id')
+            if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+              echo "::error::No successful wind-download-cfsv2 run found. Trigger wind-download-cfsv2.yml first." >&2
+              exit 1
+            fi
+            echo "Using most recent successful download run: $RUN_ID"
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Download data artifact from that run
+        uses: actions/download-artifact@v4
+        with:
+          name: cfsv2-daily-data
+          path: data_cfsv2
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ steps.resolve.outputs.run_id }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies for cartopy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgeos-dev libproj-dev proj-bin proj-data
+
+      - name: Install Python dependencies
+        run: pip install -r scripts/requirements-cfsv2-plot.txt
+
+      - name: Run plot script
+        working-directory: scripts
+        run: python plot_winds_cfsv2.py --data-dir ../data_cfsv2 --out ../outputs_cfsv2/wind_grid_cfsv2_925_850_700.png
+
+      - name: Upload figure as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cfsv2-wind-maps
+          path: outputs_cfsv2/*.png
+          retention-days: 30
