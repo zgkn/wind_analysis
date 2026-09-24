@@ -34,7 +34,7 @@ from wind_common import (
     LEVELS,
     MANIFEST_FILENAME,
     WINDOW_START,
-    daily_file_path,
+    daily_file_stub,
     days_in_window,
     default_window_end,
     open_year_dataset,
@@ -44,46 +44,56 @@ from wind_common import (
 )
 
 
-def _unwrap_if_zip(path: Path) -> None:
-    """derived-era5-pressure-levels-daily-statistics sometimes delivers a
-    zip archive even though format=netcdf was requested (the older
-    reanalysis-*-monthly-means dataset never did this). If path is
-    actually a zip, extract its single .nc member in place so downstream
-    code always sees real NetCDF regardless of the .nc filename."""
-    if not zipfile.is_zipfile(path):
-        return
+def _download_and_extract(client, dataset: str, request: dict, stub: Path) -> list[Path]:
+    """Retrieve one CDS request and return the real NetCDF file(s) it
+    contains. derived-era5-pressure-levels-daily-statistics sometimes
+    delivers a zip archive even though format=netcdf was requested (the
+    older reanalysis-*-monthly-means dataset never did this), and when it
+    does, u and v each come back as a separate .nc member rather than one
+    combined file. Handle both shapes rather than assuming either one.
+    """
+    raw = stub.with_suffix(".download")
+    client.retrieve(dataset, request, str(raw))
 
-    with zipfile.ZipFile(path) as zf:
+    if not zipfile.is_zipfile(raw):
+        final = stub.with_suffix(".nc")
+        raw.replace(final)
+        return [final]
+
+    extracted = []
+    with zipfile.ZipFile(raw) as zf:
         nc_members = [n for n in zf.namelist() if n.endswith(".nc")]
-        if len(nc_members) != 1:
-            raise RuntimeError(
-                f"{path} is a zip archive but doesn't contain exactly one "
-                f".nc file (found {zf.namelist()}) -- update _unwrap_if_zip "
-                "to handle this archive layout."
-            )
-        extracted = zf.read(nc_members[0])
-
-    tmp_path = path.with_suffix(".tmp")
-    tmp_path.write_bytes(extracted)
-    tmp_path.replace(path)
+        if not nc_members:
+            raise RuntimeError(f"{raw} is a zip archive with no .nc members: {zf.namelist()}")
+        for member in nc_members:
+            suffix = Path(member).stem
+            out_path = stub.parent / f"{stub.name}_{suffix}.nc"
+            out_path.write_bytes(zf.read(member))
+            extracted.append(out_path)
+    raw.unlink()
+    return extracted
 
 
 def download_year(client, year: int, months_days: dict[int, list[int]], data_dir: Path) -> list[Path]:
     """Download one year's daily-mean u/v wind at the target levels, one CDS
     request per calendar month in the window (a month may need a full set of
-    days or a partial one, depending on where it falls in the window).
+    days or a partial one, depending on where it falls in the window). CDS
+    may return each month's request as one file or several (see
+    _download_and_extract) -- callers shouldn't assume a fixed count.
 
-    Returns the list of NetCDF file paths for that year. Skips a request if
-    its file already exists (handy for re-runs / manual triggers).
+    Returns the list of NetCDF file paths for that year. Skips a month's
+    request if matching file(s) already exist (handy for re-runs / manual
+    triggers).
     """
     data_dir.mkdir(parents=True, exist_ok=True)
     paths = []
 
     for month, days in sorted(months_days.items()):
-        target = daily_file_path(data_dir, year, month)
-        if target.exists():
-            print(f"[{year}-{month:02d}] already downloaded -> {target}")
-            paths.append(target)
+        stub = daily_file_stub(data_dir, year, month)
+        existing = sorted(data_dir.glob(f"{stub.name}*.nc"))
+        if existing:
+            print(f"[{year}-{month:02d}] already downloaded -> {existing}")
+            paths.extend(existing)
             continue
 
         request = {
@@ -101,14 +111,11 @@ def download_year(client, year: int, months_days: dict[int, list[int]], data_dir
         }
 
         print(f"[{year}-{month:02d}] requesting {len(days)} day(s) at levels {LEVELS} hPa ...")
-        client.retrieve(
-            "derived-era5-pressure-levels-daily-statistics",
-            request,
-            str(target),
+        month_paths = _download_and_extract(
+            client, "derived-era5-pressure-levels-daily-statistics", request, stub
         )
-        _unwrap_if_zip(target)
-        print(f"[{year}-{month:02d}] saved -> {target}")
-        paths.append(target)
+        print(f"[{year}-{month:02d}] saved -> {month_paths}")
+        paths.extend(month_paths)
 
     return paths
 

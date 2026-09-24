@@ -23,7 +23,6 @@ from wind_common import (
     DATA_DIR,
     MANIFEST_FILENAME,
     OUTPUT_DIR,
-    daily_file_path,
     open_year_dataset,
     time_dim_name,
 )

@@ -68,8 +68,12 @@ def window_label(start: tuple[int, int], end: tuple[int, int]) -> str:
     return f"{date(2000, *start).strftime('%b %d')}–{date(2000, *end).strftime('%b %d')}"
 
 
-def daily_file_path(data_dir: Path, year: int, month: int) -> Path:
-    return data_dir / f"era5_daily_winds_{year}_{month:02d}.nc"
+def daily_file_stub(data_dir: Path, year: int, month: int) -> Path:
+    """Base name (no extension) for one (year, month) request. CDS may
+    deliver that request as a single .nc or as several (e.g. one per
+    variable), so this isn't necessarily one physical file -- see
+    download_winds.py's _download_and_extract."""
+    return data_dir / f"era5_daily_winds_{year}_{month:02d}"
 
 
 # ---------------------------------------------------------------------------
