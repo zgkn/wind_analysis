@@ -17,12 +17,33 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import xarray as xr
+from matplotlib.colors import LinearSegmentedColormap
 
 from wind_common import AREA, standardize_names
 
 DATA_DIR = Path("data_daily")
 OUTPUT_DIR = Path("outputs_daily")
 MANIFEST_FILENAME = "manifest.json"
+
+# Approximation of ECMWF's wind-speed chart style (white/blue at calm,
+# through green/yellow, to orange/red/purple at the highest speeds). Not
+# pixel-exact to ECMWF's published color table -- this environment has no
+# way to fetch that definition -- but matches the same visual convention.
+ECMWF_WIND_STOPS = [
+    (0.00, "#FFFFFF"),
+    (0.10, "#C9E7F5"),
+    (0.20, "#7EB6D9"),
+    (0.32, "#4F9DC4"),
+    (0.42, "#5CB88A"),
+    (0.52, "#9ED96C"),
+    (0.62, "#F5E642"),
+    (0.72, "#F5A623"),
+    (0.82, "#E8542A"),
+    (0.90, "#C31F1F"),
+    (0.96, "#8B1FA2"),
+    (1.00, "#D183D1"),
+]
+ECMWF_WIND_CMAP = LinearSegmentedColormap.from_list("ecmwf_wind", ECMWF_WIND_STOPS)
 
 
 def main():
@@ -63,15 +84,16 @@ def main():
     proj = ccrs.PlateCarree() if have_cartopy else None
     for day in days:
         day_times = [t for t in times if t.date() == day]
+        nrows, ncols = 2, 2
         fig, axes = plt.subplots(
-            1, len(day_times),
-            figsize=(4.2 * len(day_times), 4.0),
+            nrows, ncols,
+            figsize=(9.0, 8.6),
             subplot_kw={"projection": proj} if have_cartopy else {},
             squeeze=False,
         )
         mesh = None
         for j, t in enumerate(day_times):
-            ax = axes[0][j]
+            ax = axes[j // ncols][j % ncols]
             frame = ds.sel(time=t)
             u, v = frame["u"], frame["v"]
             speed = np.sqrt(u**2 + v**2)
@@ -81,13 +103,13 @@ def main():
             kwargs = {"transform": ccrs.PlateCarree()} if have_cartopy else {}
             mesh = ax.pcolormesh(
                 lon, lat, speed.values,
-                cmap="viridis", vmin=0, vmax=vmax, shading="auto", **kwargs
+                cmap=ECMWF_WIND_CMAP, vmin=0, vmax=vmax, shading="auto", **kwargs
             )
             step = max(1, len(lon) // 20)
             ax.quiver(
                 lon[::step], lat[::step],
                 u.values[::step, ::step], v.values[::step, ::step],
-                color="white", scale=200, width=0.004, **kwargs
+                color="black", scale=200, width=0.004, **kwargs
             )
             if have_cartopy:
                 ax.add_feature(cfeature.COASTLINE, linewidth=0.6)
@@ -95,13 +117,16 @@ def main():
                 ax.set_extent([AREA[1], AREA[3], AREA[2], AREA[0]], crs=ccrs.PlateCarree())
             ax.set_title(t.strftime("%H:%M UTC"), fontsize=11)
 
+        for j in range(len(day_times), nrows * ncols):
+            axes[j // ncols][j % ncols].set_visible(False)
+
         fig.suptitle(
             f"{level} hPa wind, {day.isoformat()} — Singapore / Peninsular Malaysia / Sumatra / Kalimantan\n"
             "(ERA5 synoptic-hour snapshots, not daily-averaged)",
-            fontsize=13, y=1.04,
+            fontsize=13, y=0.98,
         )
-        fig.subplots_adjust(right=0.9, top=0.78, left=0.06)
-        cbar_ax = fig.add_axes([0.92, 0.15, 0.015, 0.7])
+        fig.subplots_adjust(right=0.88, top=0.88, left=0.06, wspace=0.15, hspace=0.2)
+        cbar_ax = fig.add_axes([0.90, 0.15, 0.02, 0.65])
         fig.colorbar(mesh, cax=cbar_ax, label="Wind speed (m/s)")
 
         out_path = out_dir / f"wind_{level}hpa_{day.isoformat()}.png"
