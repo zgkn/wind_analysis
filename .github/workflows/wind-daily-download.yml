@@ -1,0 +1,71 @@
+name: SE Asia Wind Daily Synoptic Download (925 hPa)
+
+# Manual trigger only. Downloads raw (un-averaged) synoptic-hour ERA5 wind
+# at a single level for a range of September days in one year -- separate
+# from wind-download.yml, which fetches daily-mean data for the seasonal
+# multi-year comparison. Run wind-daily-plot.yml separately to generate the
+# per-day images.
+on:
+  workflow_dispatch:
+    inputs:
+      year:
+        description: "Year to fetch"
+        required: false
+        default: "2026"
+      level:
+        description: "Pressure level in hPa"
+        required: false
+        default: "925"
+      start_day:
+        description: "First September day to include"
+        required: false
+        default: "8"
+      end_day:
+        description: "Last September day to include (blank = today minus lag_days)"
+        required: false
+        default: ""
+      lag_days:
+        description: "Days behind today to use as end_day when end_day is blank"
+        required: false
+        default: "6"
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install -r scripts/requirements-download.txt
+
+      - name: Configure CDS API credentials
+        env:
+          CDS_API_URL: ${{ secrets.CDS_API_URL || 'https://cds.climate.copernicus.eu/api' }}
+          CDS_API_KEY: ${{ secrets.CDS_API_KEY }}
+        run: |
+          cat > ~/.cdsapirc <<EOF
+          url: ${CDS_API_URL}
+          key: ${CDS_API_KEY}
+          EOF
+
+      - name: Download + validate synoptic-hour wind data
+        working-directory: scripts
+        run: |
+          ARGS="--year ${{ github.event.inputs.year }} --level ${{ github.event.inputs.level }} --start-day ${{ github.event.inputs.start_day }} --lag-days ${{ github.event.inputs.lag_days }} --data-dir ../data_daily"
+          if [ -n "${{ github.event.inputs.end_day }}" ]; then
+            ARGS="$ARGS --end-day ${{ github.event.inputs.end_day }}"
+          fi
+          python download_synoptic_hourly.py $ARGS
+
+      - name: Upload downloaded data as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: era5-synoptic-hourly-data
+          path: data_daily/
+          retention-days: 90
