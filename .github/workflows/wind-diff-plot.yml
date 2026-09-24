@@ -1,0 +1,89 @@
+name: SE Asia Wind Difference Plot (925/850/700 hPa)
+
+# Manual trigger only. Pulls the data artifact from a wind-download.yml run
+# (the most recent successful one by default) and plots wind SPEED and
+# DIRECTION differences between a reference year and each other comparison
+# year -- never calls the CDS API.
+on:
+  workflow_dispatch:
+    inputs:
+      download_run_id:
+        description: "Run ID of the wind-download run to plot from (blank = most recent successful wind-download run)"
+        required: false
+        default: ""
+      reference_year:
+        description: "Year to compare every other year against (blank = most recent year in the manifest)"
+        required: false
+        default: ""
+      weak_threshold:
+        description: "Wind speed (m/s) below which direction is masked as unstable/undefined"
+        required: false
+        default: "1.0"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  plot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Resolve download run ID
+        id: resolve
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ github.event.inputs.download_run_id }}" ]; then
+            RUN_ID="${{ github.event.inputs.download_run_id }}"
+            echo "Using specified download run: $RUN_ID"
+          else
+            RUN_ID=$(gh api "repos/${{ github.repository }}/actions/workflows/wind-download.yml/runs?status=success&per_page=1" --jq '.workflow_runs[0].id')
+            if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+              echo "::error::No successful wind-download run found. Trigger wind-download.yml first." >&2
+              exit 1
+            fi
+            echo "Using most recent successful download run: $RUN_ID"
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Download data artifact from that run
+        uses: actions/download-artifact@v4
+        with:
+          name: era5-daily-data
+          path: data
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ steps.resolve.outputs.run_id }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies for cartopy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgeos-dev libproj-dev proj-bin proj-data
+
+      - name: Install Python dependencies
+        run: pip install -r scripts/requirements-plot.txt
+
+      - name: Run diff plot script
+        working-directory: scripts
+        run: |
+          ARGS="--data-dir ../data --weak-threshold ${{ github.event.inputs.weak_threshold }} --speed-out ../outputs/wind_speed_diff.png --direction-out ../outputs/wind_direction_diff.png"
+          if [ -n "${{ github.event.inputs.reference_year }}" ]; then
+            ARGS="$ARGS --reference-year ${{ github.event.inputs.reference_year }}"
+          fi
+          python plot_wind_diff.py $ARGS
+
+      - name: Upload figures as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wind-diff-maps
+          path: |
+            outputs/wind_speed_diff.png
+            outputs/wind_direction_diff.png
+          retention-days: 30
